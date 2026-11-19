@@ -67,6 +67,7 @@ const duration = file => new Promise(res => {
   p.on('close', () => res(parseFloat(o) || 0));
 });
 
+// GEMINI SCRIPT GENERATOR WITH RETRY + BACKUP
 async function makeScript(prompt, lang) {
   const key = process.env.GEMINI_API_KEY;
 
@@ -74,21 +75,33 @@ async function makeScript(prompt, lang) {
     throw new Error('GEMINI_API_KEY missing');
   }
 
-  const models = [
-    process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-    process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite'
-  ];
+  const primaryModel =
+    process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+  const fallbackModel =
+    process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite';
+
+  const models = [...new Set([
+    primaryModel,
+    fallbackModel
+  ])];
 
   const ask = `Write a short video script (5 to 7 scenes) for: "${prompt}". Narration language: ${lang === 'hi' ? 'Hindi (Devanagari)' : 'English'}. Return only JSON: {"title":"","scenes":[{"narration":"1-2 short sentences","image_prompt":"detailed cinematic visual description in English"}]}`;
 
   let lastError;
 
-  for (const model of [...new Set(models)]) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        console.log(`Gemini model: ${model}, attempt: ${attempt + 1}`);
+  for (const model of models) {
+    console.log(`Starting Gemini model: ${model}`);
 
-        const r = await fetch(
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      let response;
+
+      try {
+        console.log(
+          `Gemini ${model}: attempt ${attempt}/4`
+        );
+
+        response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
           {
             method: 'POST',
@@ -102,85 +115,133 @@ async function makeScript(prompt, lang) {
               generationConfig: {
                 responseMimeType: 'application/json'
               }
-            })
+            }),
+            signal: AbortSignal.timeout(120000)
           }
         );
 
-        if (r.status === 503 || r.status === 429) {
-          lastError = new Error(
-            `Gemini ${model} unavailable: HTTP ${r.status}`
+        if (!response.ok) {
+          const errorText = await response.text();
+
+          const error = new Error(
+            `Gemini ${model} error ${response.status}: ${errorText.slice(0, 300)}`
           );
 
-          if (attempt < 2) {
-            const delay = 2000 * (2 ** attempt);
-            console.log(`Retrying after ${delay}ms`);
-            await new Promise(resolve => setTimeout(resolve, delay));
-            continue;
+          lastError = error;
+
+          if (response.status === 404) {
+            console.log(
+              `Model ${model} not available. Trying backup model.`
+            );
+            break;
           }
 
-          break;
+          if (
+            ![408, 429, 500, 502, 503, 504].includes(response.status)
+          ) {
+            throw error;
+          }
+
+          throw error;
         }
 
-        if (!r.ok) {
-          const errorText = await r.text();
+        const result = await response.json();
+
+        const responseText =
+          result.candidates?.[0]?.content?.parts
+            ?.map(part => part.text || '')
+            .join('');
+
+        if (!responseText) {
           throw new Error(
-            `Gemini error ${r.status}: ${errorText.slice(0, 300)}`
+            'Gemini returned an empty response'
           );
         }
 
-        const j = await r.json();
+        const cleanText = responseText
+          .replace(/^```json\s*/i, '')
+          .replace(/^```\s*/i, '')
+          .replace(/\s*```$/, '')
+          .trim();
 
-        const text = j.candidates?.[0]?.content?.parts
-          ?.map(part => part.text || '')
-          .join('');
+        const data = JSON.parse(cleanText);
 
-        if (!text) {
-          throw new Error('Gemini returned an empty response');
-        }
-
-        const data = JSON.parse(text);
-
-        if (!data.scenes?.length) {
+        if (
+          !Array.isArray(data.scenes) ||
+          data.scenes.length === 0
+        ) {
           throw new Error('Script me scenes nahi mile');
         }
 
-        console.log(`Script generated successfully using ${model}`);
+        console.log(
+          `Script generated successfully using ${model}`
+        );
+
         return data;
 
-      } catch (e) {
-        lastError = e;
+      } catch (error) {
+        lastError = error;
 
-        console.error(`${model} error:`, e.message);
+        const errorMessage = [
+          error.message || '',
+          error.cause?.message || '',
+          error.cause?.code || '',
+          error.code || ''
+        ].join(' ');
 
-        if (
-          !e.message.includes('503') &&
-          !e.message.includes('429') &&
-          !e.message.includes('unavailable')
-        ) {
-          throw e;
+        console.error(
+          `Gemini ${model}, attempt ${attempt}:`,
+          errorMessage
+        );
+
+        const retryable =
+          /fetch failed|HeadersTimeoutError|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_HEADERS_TIMEOUT|AbortError/i.test(errorMessage) ||
+          [408, 429, 500, 502, 503, 504].some(status =>
+            errorMessage.includes(` ${status}:`)
+          );
+
+        if (!retryable) {
+          throw error;
         }
 
-        if (attempt < 2) {
+        if (attempt < 4) {
+          const delay = 3000 * (2 ** (attempt - 1));
+
+          console.log(
+            `Temporary error. Retrying in ${delay / 1000} seconds...`
+          );
+
           await new Promise(resolve =>
-            setTimeout(resolve, 2000 * (2 ** attempt))
+            setTimeout(resolve, delay)
+          );
+        } else {
+          console.log(
+            `Retries exhausted for ${model}.`
           );
         }
       }
     }
 
-    console.log(`Trying next Gemini model after ${model}`);
+    console.log(
+      `Trying next Gemini model after ${model}`
+    );
   }
 
-  throw lastError || new Error('All Gemini models unavailable');
+  throw lastError || new Error(
+    'All Gemini models unavailable'
+  );
 }
 
+// IMAGE GENERATOR
 async function makeImage(text, file, w, h) {
   const url =
     `https://image.pollinations.ai/prompt/${encodeURIComponent(
       text + ', cinematic, dramatic lighting, high detail'
     )}?width=${w}&height=${h}&nologo=true&seed=${Math.floor(Math.random() * 1e6)}`;
 
-  const r = await fetch(url);
+  const r = await fetch(url, {
+    signal: AbortSignal.timeout(120000)
+  });
 
   if (!r.ok) {
     throw new Error(`Image error ${r.status}`);
@@ -192,6 +253,7 @@ async function makeImage(text, file, w, h) {
   );
 }
 
+// VIDEO CLIP GENERATOR
 async function makeClip(img, wav, out, w, h) {
   const dur = (await duration(wav)) + 0.6;
   const frames = Math.ceil(dur * 25);
@@ -216,6 +278,7 @@ async function makeClip(img, wav, out, w, h) {
   ]);
 }
 
+// MAIN VIDEO PIPELINE
 async function pipeline(id, prompt, lang, format) {
   const job = jobs.get(id);
 
@@ -248,7 +311,12 @@ async function pipeline(id, prompt, lang, format) {
         10 + (i / n) * 70
       );
 
-      await makeImage(s.image_prompt, base + '.jpg', w, h);
+      await makeImage(
+        s.image_prompt,
+        base + '.jpg',
+        w,
+        h
+      );
 
       set(
         `Scene ${i + 1}/${n}: voiceover ban raha hai...`,
@@ -258,7 +326,10 @@ async function pipeline(id, prompt, lang, format) {
       await new EdgeTTS({
         voice,
         lang: vlang
-      }).ttsPromise(s.narration, base + '.mp3');
+      }).ttsPromise(
+        s.narration,
+        base + '.mp3'
+      );
 
       set(
         `Scene ${i + 1}/${n}: edit ho raha hai...`,
@@ -328,6 +399,8 @@ async function pipeline(id, prompt, lang, format) {
       url: `/output/${id}/final.mp4`
     });
 
+    console.log(`Job ${id} completed successfully`);
+
   } catch (e) {
     console.error('Pipeline error:', e);
 
@@ -338,6 +411,7 @@ async function pipeline(id, prompt, lang, format) {
   }
 }
 
+// GENERATE API
 app.post('/api/generate', (req, res) => {
   const {
     prompt,
@@ -345,7 +419,7 @@ app.post('/api/generate', (req, res) => {
     format = '9:16'
   } = req.body || {};
 
-  if (!prompt || prompt.trim().length < 3) {
+  if (!prompt || typeof prompt !== 'string' || prompt.trim().length < 3) {
     return res.status(400).json({
       error: 'Prompt likho'
     });
@@ -359,17 +433,28 @@ app.post('/api/generate', (req, res) => {
     pct: 0
   });
 
-  pipeline(id, prompt.trim(), lang, format);
+  pipeline(id, prompt.trim(), lang, format)
+    .catch(error => {
+      console.error('Unexpected pipeline error:', error);
+
+      Object.assign(jobs.get(id), {
+        status: 'error',
+        error: error.message
+      });
+    });
 
   res.json({ id });
 });
 
+// JOB STATUS API
 app.get('/api/status/:id', (req, res) => {
   const j = jobs.get(req.params.id);
 
   j
     ? res.json(j)
-    : res.status(404).json({ error: 'Job nahi mila' });
+    : res.status(404).json({
+        error: 'Job nahi mila'
+      });
 });
 
 const PORT = Number(process.env.PORT) || 3000;
